@@ -1,0 +1,95 @@
+# Builds the data of tasks/ground/bev_interaction_quantification on GitHub's machines, so nothing runs locally.
+# Run it from this fork's Actions tab ("Run workflow"). It only ever commits to the task branch, never to main.
+#   step = build : download the IEDD release (Egikk/IEDD, about 220 MB), build the events, commit the answers and the
+#                  event list to the task branch, and open the clips' upload as a pull request on Hugging Face
+#                  (needs the repository secret HF_TOKEN; without it the clips are kept as the run's artifact)
+#   step = pin   : after the Hugging Face pull request is merged, write environment/assets.sha256 at that commit
+name: build bev_interaction_quantification
+on:
+  workflow_dispatch:
+    inputs:
+      step:
+        description: "build, or pin (after the asset pull request is merged)"
+        type: choice
+        options: [build, pin]
+        default: build
+      asset_revision:
+        description: "pin only: the 40-hex commit of grounded-intelligence-initiative/ale-robotics-assets holding the clips"
+        required: false
+        default: ""
+permissions:
+  contents: write
+concurrency:
+  group: build-bev-task
+  cancel-in-progress: false
+env:
+  BRANCH: add-bev-interaction-quantification
+  TASK: tasks/ground/bev_interaction_quantification
+  ASSETS: grounded-intelligence-initiative/ale-robotics-assets
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the Hugging Face CLI and OpenCV
+        run: python -m pip install -U huggingface_hub opencv-python-headless
+      - name: Commit as the person who ran the workflow
+        run: |
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR_ID}+${GITHUB_ACTOR}@users.noreply.github.com"
+
+      - name: Build the events from the IEDD release
+        if: inputs.step == 'build'
+        run: |
+          bash "$TASK/tests/review/build_from_hf.sh" "$RUNNER_TEMP/iedd" 2>&1 | tee "$RUNNER_TEMP/build.log"
+          sha=$(sed -n 's/^Egikk\/IEDD commit: \([0-9a-f]\{40\}\)$/\1/p' "$RUNNER_TEMP/build.log")
+          if [ -n "$sha" ]; then
+            sed -i "s/\`Egikk\/IEDD\` at commit TODO(author)/\`Egikk\/IEDD\` at commit $sha/" "$TASK/tests/NOTICE.md"
+          fi
+          { echo '### Build'; echo '```'; cat "$RUNNER_TEMP/build.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit the answers and the event list to the task branch
+        if: inputs.step == 'build'
+        run: |
+          git add "$TASK/tests/ref" "$TASK/solution/ref" "$TASK/environment/setup/payload/clips.json" "$TASK/tests/NOTICE.md"
+          git commit -m "bev_interaction_quantification: IEDD-VQA test events" \
+              -m "Built by tests/review/build_from_hf.sh (seed 20261125) in the fork's build workflow."
+          git push origin "HEAD:$BRANCH"
+      - name: Keep the clips as the run's artifact
+        if: inputs.step == 'build'
+        uses: actions/upload-artifact@v4
+        with:
+          name: asset-upload
+          path: ${{ runner.temp }}/iedd/upload
+      - name: Open the clips' upload as a pull request on Hugging Face
+        if: inputs.step == 'build'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "No HF_TOKEN secret: upload the asset-upload artifact to $ASSETS by hand." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          hf upload "$ASSETS" "$RUNNER_TEMP/iedd/upload" "$TASK/payload" --repo-type dataset --create-pr \
+              --commit-message "Add the clips of $TASK" 2>&1 | tee "$RUNNER_TEMP/upload.log"
+          { echo '### Hugging Face pull request'; echo '```'; cat "$RUNNER_TEMP/upload.log"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pin the clips at the asset dataset commit
+        if: inputs.step == 'pin'
+        env:
+          REV: ${{ inputs.asset_revision }}
+        run: |
+          echo "$REV" | grep -Eq '^[0-9a-f]{40}$' || { echo "asset_revision must be the 40-hex commit"; exit 1; }
+          hf download "$ASSETS" --repo-type dataset --revision "$REV" --include "$TASK/payload/*" \
+              --local-dir "$RUNNER_TEMP/assets"
+          python3 scripts/task_assets.py list "$TASK" "$RUNNER_TEMP/assets/$TASK/payload" --revision "$REV"
+          python3 scripts/task_assets.py check
+          git add "$TASK/environment/assets.sha256" "$TASK/environment/fetch_assets.py"
+          git commit -m "bev_interaction_quantification: pin the clips at $ASSETS@${REV:0:12}"
+          git push origin "HEAD:$BRANCH"
+          { echo '### assets.sha256'; echo '```'; cat "$TASK/environment/assets.sha256"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
